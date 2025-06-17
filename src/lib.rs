@@ -3,7 +3,6 @@ use eframe::egui;
 use image::imageops::FilterType;
 use image::ImageEncoder;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,8 +33,8 @@ pub struct Args {
     #[arg(short, long, default_value = "feh --bg-max")]
     pub command: String,
     
-    #[arg(short, long, default_value = "background-picker-state.yaml")]
-    pub state_file: PathBuf,
+    #[arg(short, long, default_value = "selected-background.txt")]
+    pub selected_image_file: PathBuf,
     
     #[arg(long, help = "Enable debug output")]
     pub debug: bool,
@@ -44,12 +43,6 @@ pub struct Args {
     pub pregenerate: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
-pub struct AppState {
-    pub last_selected: Option<String>,
-    pub favorites: Vec<String>,
-    pub window_size: (f32, f32),
-}
 
 #[derive(Clone)]
 pub struct ImageInfo {
@@ -61,7 +54,6 @@ pub struct ImageInfo {
 
 pub struct BackgroundPickerApp {
     pub args: Args,
-    pub state: AppState,
     pub images: Arc<RwLock<Vec<ImageInfo>>>,
     pub folder_tree: BTreeMap<String, Vec<usize>>,
     pub loading: bool,
@@ -73,7 +65,6 @@ pub struct BackgroundPickerApp {
 
 impl BackgroundPickerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, args: Args) -> Self {
-        let state = Self::load_state(&args.state_file).unwrap_or_default();
         let (thumbnail_sender, thumbnail_receiver) = std::sync::mpsc::channel();
         
         // Create thread pool with optimal number of threads
@@ -90,7 +81,6 @@ impl BackgroundPickerApp {
         
         let mut app = Self {
             args,
-            state,
             images: Arc::new(RwLock::new(Vec::new())),
             folder_tree: BTreeMap::new(),
             loading: true,
@@ -166,16 +156,6 @@ impl BackgroundPickerApp {
     }
     
     
-    pub fn load_state(path: &Path) -> anyhow::Result<AppState> {
-        let content = std::fs::read_to_string(path)?;
-        Ok(serde_yaml::from_str(&content)?)
-    }
-    
-    pub fn save_state(&self) -> anyhow::Result<()> {
-        let content = serde_yaml::to_string(&self.state)?;
-        std::fs::write(&self.args.state_file, content)?;
-        Ok(())
-    }
     
     pub fn scan_images(&mut self) {
         let base_path = &self.args.directory;
@@ -667,6 +647,14 @@ impl BackgroundPickerApp {
         
         Ok(())
     }
+    
+    pub fn save_selected_image(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = self.args.selected_image_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&self.args.selected_image_file, path.to_string_lossy().as_bytes())?;
+        Ok(())
+    }
 }
 
 impl eframe::App for BackgroundPickerApp {
@@ -730,8 +718,7 @@ impl eframe::App for BackgroundPickerApp {
                                             if let Err(e) = self.set_background(&path) {
                                                 eprintln!("Failed to set background: {}", e);
                                             } else {
-                                                self.state.last_selected = Some(relative_path.clone());
-                                                let _ = self.save_state();
+                                                let _ = self.save_selected_image(&path);
                                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                                             }
                                         }
@@ -774,13 +761,9 @@ impl eframe::App for BackgroundPickerApp {
             });
         });
         
-        self.state.window_size = (ctx.screen_rect().width(), ctx.screen_rect().height());
         ctx.request_repaint(); // Keep updating to process thumbnail results
     }
     
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = self.save_state();
-    }
 }
 
 pub fn is_image_file(path: &Path) -> bool {

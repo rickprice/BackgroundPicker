@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.9"
 image = { version = "0.24", features = ["jpeg", "png"], default-features = false }
 walkdir = "2.4"
 eframe = "0.28"
