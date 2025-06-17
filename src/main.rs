@@ -2,16 +2,18 @@ use clap::Parser;
 use eframe::egui;
 use image::imageops::FilterType;
 use image::ImageEncoder;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::fs;
+use std::io::{self, Write};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(name = "background-picker")]
 #[command(about = "A GUI tool for selecting desktop backgrounds")]
 struct Args {
@@ -21,11 +23,17 @@ struct Args {
     #[arg(short, long, default_value = "150")]
     thumbnail_size: u32,
     
-    #[arg(short, long, default_value = "feh --bg-scale")]
+    #[arg(short, long, default_value = "feh --bg-max")]
     command: String,
     
     #[arg(short, long, default_value = "background-picker-state.yaml")]
     state_file: String,
+    
+    #[arg(long, help = "Enable debug output")]
+    debug: bool,
+    
+    #[arg(long, help = "Pre-generate all thumbnails and exit (don't show GUI)")]
+    pregenerate: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -68,7 +76,9 @@ impl BackgroundPickerApp {
         
         // Set up thumbnail cache directory (freedesktop.org spec)
         let cache_dir = Self::get_thumbnail_cache_dir();
-        println!("Using thumbnail cache directory: {:?}", cache_dir);
+        if args.debug {
+            println!("Using thumbnail cache directory: {:?}", cache_dir);
+        }
         
         let mut app = Self {
             args,
@@ -83,6 +93,13 @@ impl BackgroundPickerApp {
         };
         
         app.scan_images();
+        
+        if app.args.pregenerate {
+            app.pregenerate_all_thumbnails();
+            // Exit after pregeneration, don't show GUI
+            std::process::exit(0);
+        }
+        
         app
     }
     
@@ -162,7 +179,9 @@ impl BackgroundPickerApp {
         }
         self.folder_tree.clear();
         
-        println!("Scanning directory: {:?}", base_path);
+        if self.args.debug {
+            println!("Scanning directory: {:?}", base_path);
+        }
         
         for entry in WalkDir::new(&self.args.directory)
             .into_iter()
@@ -195,7 +214,9 @@ impl BackgroundPickerApp {
                         index
                     };
                     
-                    println!("Found image: {:?} in folder: {}", relative_path, folder);
+                    if self.args.debug {
+                        println!("Found image: {:?} in folder: {}", relative_path, folder);
+                    }
                     
                     self.folder_tree
                         .entry(folder)
@@ -206,9 +227,133 @@ impl BackgroundPickerApp {
         }
         
         let image_count = self.images.lock().unwrap().len();
-        println!("Found {} images in {} folders", image_count, self.folder_tree.len());
+        if self.args.debug {
+            println!("Found {} images in {} folders", image_count, self.folder_tree.len());
+        }
         
         self.loading = false;
+    }
+    
+    fn pregenerate_all_thumbnails(&mut self) {
+        let total_images = self.images.lock().unwrap().len();
+        
+        if total_images == 0 {
+            if self.args.debug {
+                println!("No images found to pregenerate thumbnails for");
+            }
+            return;
+        }
+        
+        if self.args.debug {
+            println!("Pre-generating thumbnails for {} images...", total_images);
+        } else {
+            println!("Generating thumbnails for {} images...", total_images);
+        }
+        
+        let start_time = std::time::Instant::now();
+        let mut generated_count = 0;
+        let mut cached_count = 0;
+        
+        // Use rayon to process all images in parallel
+        let cache_dir = self.cache_dir.clone();
+        let size = self.args.thumbnail_size;
+        let debug = self.args.debug;
+        let images = self.images.clone();
+        
+        let results: Vec<(bool, bool)> = (0..total_images).into_iter().collect::<Vec<_>>()
+            .chunks(100) // Process in chunks for progress reporting
+            .enumerate()
+            .flat_map(|(chunk_idx, chunk)| {
+                let chunk_results: Vec<(bool, bool)> = chunk.par_iter().map(|&index| {
+                    let path = {
+                        let images_guard = images.lock().unwrap();
+                        if index >= images_guard.len() {
+                            return (false, false); // (was_cached, was_generated)
+                        }
+                        images_guard[index].path.clone()
+                    };
+                    
+                    let abs_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.to_path_buf());
+                    
+                    // Check if thumbnail already exists
+                    if let Some(existing_thumbnail) = Self::find_existing_thumbnail(&abs_path) {
+                        if Self::load_cached_thumbnail(&existing_thumbnail, size).is_some() {
+                            if debug {
+                                println!("  [{}] Found existing thumbnail: {:?}", 
+                                    index + 1, path.file_name().unwrap_or_default());
+                            }
+                            return (true, false); // was cached
+                        }
+                    }
+                    
+                    if let Some(cache_path) = Self::get_cached_thumbnail_path_static(&abs_path, &cache_dir) {
+                        if Self::is_thumbnail_cache_valid_static(&abs_path, &cache_path) {
+                            if Self::load_cached_thumbnail(&cache_path, size).is_some() {
+                                if debug {
+                                    println!("  [{}] Found cached thumbnail: {:?}", 
+                                        index + 1, path.file_name().unwrap_or_default());
+                                }
+                                return (true, false); // was cached
+                            }
+                        }
+                    }
+                    
+                    // Generate new thumbnail
+                    if let Some(color_image) = Self::fast_thumbnail_generation(&abs_path, size) {
+                        // Save to cache
+                        if let Some(cache_path) = Self::get_cached_thumbnail_path_static(&abs_path, &cache_dir) {
+                            Self::save_thumbnail_to_cache(&color_image, &cache_path, &abs_path);
+                        }
+                        
+                        if debug {
+                            println!("  [{}] Generated thumbnail: {:?}", 
+                                index + 1, path.file_name().unwrap_or_default());
+                        }
+                        (false, true) // was generated
+                    } else {
+                        if debug {
+                            println!("  [{}] Failed to generate thumbnail: {:?}", 
+                                index + 1, path.file_name().unwrap_or_default());
+                        }
+                        (false, false)
+                    }
+                }).collect();
+                
+                // Show progress for large collections
+                if !debug && total_images > 50 {
+                    let completed = (chunk_idx + 1) * 100.min(total_images);
+                    print!("\rProgress: {}/{} images processed", completed, total_images);
+                    io::stdout().flush().ok();
+                }
+                
+                chunk_results
+            }).collect();
+        
+        // Count results
+        for (was_cached, was_generated) in results {
+            if was_cached {
+                cached_count += 1;
+            } else if was_generated {
+                generated_count += 1;
+            }
+        }
+        
+        let elapsed = start_time.elapsed();
+        
+        if !self.args.debug && total_images > 50 {
+            println!(); // New line after progress indicator
+        }
+        
+        if self.args.debug {
+            println!("Thumbnail pregeneration complete:");
+            println!("  - {} thumbnails found in cache", cached_count);
+            println!("  - {} thumbnails generated", generated_count);
+            println!("  - {} thumbnails failed", total_images - cached_count - generated_count);
+            println!("  - Time elapsed: {:.2}s", elapsed.as_secs_f64());
+        } else {
+            println!("Thumbnail generation complete: {} cached, {} generated ({:.1}s)", 
+                cached_count, generated_count, elapsed.as_secs_f64());
+        }
     }
     
     fn load_thumbnail(&mut self, _ctx: &egui::Context, index: usize) {
@@ -230,23 +375,26 @@ impl BackgroundPickerApp {
             let sender = self.thumbnail_sender.clone();
             let size = self.args.thumbnail_size;
             let cache_dir = self.cache_dir.clone();
+            let debug = self.args.debug;
             
             self.thread_pool.spawn(move || {
-                if let Some(color_image) = Self::load_or_generate_thumbnail(&path, size, &cache_dir) {
+                if let Some(color_image) = Self::load_or_generate_thumbnail(&path, size, &cache_dir, debug) {
                     let _ = sender.send((index, color_image));
                 }
             });
         }
     }
     
-    fn load_or_generate_thumbnail(path: &Path, size: u32, cache_dir: &Path) -> Option<egui::ColorImage> {
+    fn load_or_generate_thumbnail(path: &Path, size: u32, cache_dir: &Path, debug: bool) -> Option<egui::ColorImage> {
         // Get absolute path for cache key generation
         let abs_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         
         // First, look for existing thumbnails created by other applications (pcmanfm, etc.)
         if let Some(existing_thumbnail) = Self::find_existing_thumbnail(&abs_path) {
             if let Some(cached_image) = Self::load_cached_thumbnail(&existing_thumbnail, size) {
-                println!("Loaded existing system thumbnail for {:?}", path.file_name().unwrap_or_default());
+                if debug {
+                    println!("Loaded existing system thumbnail for {:?}", path.file_name().unwrap_or_default());
+                }
                 return Some(cached_image);
             }
         }
@@ -255,14 +403,18 @@ impl BackgroundPickerApp {
         if let Some(cache_path) = Self::get_cached_thumbnail_path_static(&abs_path, cache_dir) {
             if Self::is_thumbnail_cache_valid_static(&abs_path, &cache_path) {
                 if let Some(cached_image) = Self::load_cached_thumbnail(&cache_path, size) {
-                    println!("Loaded our cached thumbnail for {:?}", path.file_name().unwrap_or_default());
+                    if debug {
+                        println!("Loaded our cached thumbnail for {:?}", path.file_name().unwrap_or_default());
+                    }
                     return Some(cached_image);
                 }
             }
         }
         
         // Generate new thumbnail and cache it
-        println!("Generating new thumbnail for {:?}", path.file_name().unwrap_or_default());
+        if debug {
+            println!("Generating new thumbnail for {:?}", path.file_name().unwrap_or_default());
+        }
         let color_image = Self::fast_thumbnail_generation(&abs_path, size)?;
         
         // Save to cache for future use
@@ -461,9 +613,10 @@ impl BackgroundPickerApp {
                 let sender = self.thumbnail_sender.clone();
                 let size = self.args.thumbnail_size;
                 let cache_dir = self.cache_dir.clone();
+                let debug = self.args.debug;
                 
                 self.thread_pool.spawn(move || {
-                    if let Some(color_image) = Self::load_or_generate_thumbnail(&path, size, &cache_dir) {
+                    if let Some(color_image) = Self::load_or_generate_thumbnail(&path, size, &cache_dir, debug) {
                         let _ = sender.send((index, color_image));
                     }
                 });
