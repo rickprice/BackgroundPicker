@@ -12,7 +12,7 @@ mod cli_args_tests {
 
     #[test]
     fn test_args_default_values() {
-        let args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let args = Args::try_parse_from(["background-picker"]).unwrap();
         
         assert_eq!(args.directory, PathBuf::from("."));
         assert_eq!(args.thumbnail_size, 150);
@@ -24,7 +24,7 @@ mod cli_args_tests {
 
     #[test]
     fn test_args_custom_values() {
-        let args = Args::try_parse_from(&[
+        let args = Args::try_parse_from([
             "background-picker",
             "--directory", "/home/user/pictures",
             "--thumbnail-size", "200",
@@ -44,7 +44,7 @@ mod cli_args_tests {
 
     #[test]
     fn test_args_short_flags() {
-        let args = Args::try_parse_from(&[
+        let args = Args::try_parse_from([
             "background-picker",
             "-d", "/tmp",
             "-t", "100",
@@ -60,7 +60,7 @@ mod cli_args_tests {
 
     #[test]
     fn test_args_invalid_thumbnail_size() {
-        let result = Args::try_parse_from(&[
+        let result = Args::try_parse_from([
             "background-picker",
             "--thumbnail-size", "not_a_number"
         ]);
@@ -85,11 +85,11 @@ mod app_state_tests {
 
     #[test]
     fn test_app_state_serialization() {
-        let mut state = AppState::default();
-        state.last_selected = Some("image1.jpg".to_string());
-        state.favorites.push("image2.jpg".to_string());
-        state.favorites.push("image3.jpg".to_string());
-        state.window_size = (800.0, 600.0);
+        let state = AppState {
+            last_selected: Some("image1.jpg".to_string()),
+            favorites: vec!["image2.jpg".to_string(), "image3.jpg".to_string()],
+            window_size: (800.0, 600.0),
+        };
         
         let yaml = serde_yaml::to_string(&state).unwrap();
         let deserialized: AppState = serde_yaml::from_str(&yaml).unwrap();
@@ -485,7 +485,7 @@ mod file_scanning_tests {
         let temp_dir = TempDir::new().unwrap();
         create_test_image_structure(temp_dir.path()).unwrap();
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.directory = temp_dir.path().to_path_buf();
         args.debug = false;
         
@@ -545,7 +545,7 @@ mod file_scanning_tests {
     fn test_scan_images_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.directory = temp_dir.path().to_path_buf();
         
         let (sender, _receiver) = std::sync::mpsc::channel();
@@ -579,7 +579,7 @@ mod file_scanning_tests {
     fn test_scan_images_nonexistent_directory() {
         let nonexistent_dir = PathBuf::from("/nonexistent/directory");
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.directory = nonexistent_dir;
         
         let (sender, _receiver) = std::sync::mpsc::channel();
@@ -619,7 +619,7 @@ mod error_handling_tests {
         let test_image = temp_dir.path().join("test.jpg");
         fs::write(&test_image, b"fake image").unwrap();
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.command = "".to_string(); // Empty command
         
         let (sender, _receiver) = std::sync::mpsc::channel();
@@ -652,7 +652,7 @@ mod error_handling_tests {
         let test_image = temp_dir.path().join("test.jpg");
         fs::write(&test_image, b"fake image").unwrap();
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.command = "nonexistent_command_that_should_fail".to_string();
         
         let (sender, _receiver) = std::sync::mpsc::channel();
@@ -684,7 +684,7 @@ mod error_handling_tests {
         let test_image = temp_dir.path().join("test.jpg");
         fs::write(&test_image, b"fake image").unwrap();
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.command = "echo".to_string(); // Echo should always succeed
         
         let (sender, _receiver) = std::sync::mpsc::channel();
@@ -714,7 +714,7 @@ mod error_handling_tests {
     fn test_save_state_permission_denied() {
         let temp_dir = TempDir::new().unwrap();
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         // Try to save to a directory that doesn't exist and can't be created
         args.state_file = PathBuf::from("/root/forbidden/state.yaml");
         

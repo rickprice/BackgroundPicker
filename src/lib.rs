@@ -20,8 +20,6 @@ const MIN_THREAD_COUNT: usize = 4;
 const INTERMEDIATE_SIZE_MULTIPLIER: u32 = 4;
 const SMALL_IMAGE_THRESHOLD: u32 = 2;
 const PROGRESS_THRESHOLD: usize = 50;
-const DEFAULT_WINDOW_WIDTH: f32 = 800.0;
-const DEFAULT_WINDOW_HEIGHT: f32 = 600.0;
 
 #[derive(Parser, Clone)]
 #[command(name = "background-picker")]
@@ -120,7 +118,7 @@ impl BackgroundPickerApp {
             
             // Try to create the directory structure if it doesn't exist
             let normal_dir = thumbnails_dir.join("normal");
-            if let Err(_) = fs::create_dir_all(&normal_dir) {
+            if fs::create_dir_all(&normal_dir).is_err() {
                 eprintln!("Warning: Could not create thumbnail cache directory");
             }
             
@@ -233,7 +231,7 @@ impl BackgroundPickerApp {
                     
                     self.folder_tree
                         .entry(folder)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(image_index);
                 }
             }
@@ -304,14 +302,12 @@ impl BackgroundPickerApp {
                     }
                     
                     if let Some(cache_path) = Self::get_cached_thumbnail_path_static(&abs_path, &cache_dir) {
-                        if Self::is_thumbnail_cache_valid_static(&abs_path, &cache_path) {
-                            if Self::load_cached_thumbnail(&cache_path, size).is_some() {
-                                if debug {
-                                    println!("  [{}] Found cached thumbnail: {:?}", 
-                                        index + 1, path.file_name().unwrap_or_default());
-                                }
-                                return (true, false); // was cached
+                        if Self::is_thumbnail_cache_valid_static(&abs_path, &cache_path) && Self::load_cached_thumbnail(&cache_path, size).is_some() {
+                            if debug {
+                                println!("  [{}] Found cached thumbnail: {:?}", 
+                                    index + 1, path.file_name().unwrap_or_default());
                             }
+                            return (true, false); // was cached
                         }
                     }
                     
@@ -545,7 +541,6 @@ impl BackgroundPickerApp {
                 image::ColorType::Rgb8,
             ) {
                 eprintln!("Failed to save thumbnail for {:?}: {}", original_path, e);
-                return;
             }
         }
         

@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use serial_test::serial;
 
 #[cfg(test)]
-mod integration_tests {
+mod tests {
     use super::*;
 
     fn create_comprehensive_test_structure(base_dir: &std::path::Path) -> std::io::Result<()> {
@@ -68,7 +68,7 @@ mod integration_tests {
         let temp_dir = TempDir::new().unwrap();
         create_comprehensive_test_structure(temp_dir.path()).unwrap();
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.directory = temp_dir.path().to_path_buf();
         args.debug = true;
         args.thumbnail_size = 128;
@@ -129,7 +129,7 @@ mod integration_tests {
         
         // Verify all images have correct relative paths
         for (i, image) in images.iter().enumerate() {
-            assert!(image.relative_path.len() > 0);
+            assert!(!image.relative_path.is_empty());
             assert!(image.path.exists());
             assert!(!image.loading); // Should not be loading after scan
             assert!(image.thumbnail.is_none()); // Thumbnails not loaded yet
@@ -147,13 +147,14 @@ mod integration_tests {
         let state_file = temp_dir.path().join("test_state.yaml");
         
         // Create an initial state
-        let mut initial_state = AppState::default();
-        initial_state.last_selected = Some("vacation/beach.jpg".to_string());
-        initial_state.favorites = vec![
-            "nature/forest.jpg".to_string(),
-            "abstract/colors.png".to_string(),
-        ];
-        initial_state.window_size = (1920.0, 1080.0);
+        let initial_state = AppState {
+            last_selected: Some("vacation/beach.jpg".to_string()),
+            favorites: vec![
+                "nature/forest.jpg".to_string(),
+                "abstract/colors.png".to_string(),
+            ],
+            window_size: (1920.0, 1080.0),
+        };
         
         // Save the state
         let yaml_content = serde_yaml::to_string(&initial_state).unwrap();
@@ -168,7 +169,7 @@ mod integration_tests {
         assert_eq!(loaded_state.window_size, initial_state.window_size);
         
         // Test modification and re-saving
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.state_file = state_file.clone();
         
         let (sender, _receiver) = std::sync::mpsc::channel();
@@ -279,7 +280,7 @@ mod integration_tests {
         fs::write(&test_image, create_fake_jpeg_data()).unwrap();
         
         // Test with a simple command that should succeed
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.command = "echo test".to_string();
         
         let (sender, _receiver) = std::sync::mpsc::channel();
@@ -304,7 +305,7 @@ mod integration_tests {
         assert!(result.is_ok(), "Command execution should succeed");
         
         // Test with feh-like command structure
-        let mut args2 = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args2 = Args::try_parse_from(["background-picker"]).unwrap();
         args2.command = "echo --bg-max".to_string(); // Simulate feh --bg-max
         
         let app2 = BackgroundPickerApp {
@@ -329,7 +330,7 @@ mod integration_tests {
         let temp_dir = TempDir::new().unwrap();
         create_comprehensive_test_structure(temp_dir.path()).unwrap();
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.directory = temp_dir.path().to_path_buf();
         args.thumbnail_size = 100;
         args.debug = false; // Turn off debug for cleaner output in tests
@@ -374,7 +375,7 @@ mod integration_tests {
         if cache_dir.exists() {
             for entry in fs::read_dir(cache_dir).unwrap() {
                 let entry = entry.unwrap();
-                if entry.path().extension().map_or(false, |ext| ext == "png") {
+                if entry.path().extension().is_some_and(|ext| ext == "png") {
                     cache_files_found += 1;
                 }
             }
@@ -399,7 +400,7 @@ mod integration_tests {
         fs::write(temp_dir.path().join("no_extension"), b"file without extension").unwrap();
         fs::write(temp_dir.path().join("empty.jpg"), b"").unwrap(); // Empty file
         
-        let mut args = Args::try_parse_from(&["background-picker"]).unwrap();
+        let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         args.directory = temp_dir.path().to_path_buf();
         args.debug = false;
         
