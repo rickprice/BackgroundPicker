@@ -6,8 +6,6 @@ authors = ["Frederick Price <fprice@pricemail.ca>"]
 description = "Allow user to select a background from a directory hiearchy"
 homepage = "https://github.com/rickprice/BackgroundPicker"
 readme = "README.md"
-keywords = ["background"]
-categories = ["image"]
 license = "BSD-3-Clause"
 repository = "https://github.com/rickprice/BackgroundPicker"
 
