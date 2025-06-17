@@ -513,6 +513,7 @@ dependencies = [
  "serial_test",
  "sha1",
  "tempfile",
+ "thiserror",
  "tokio",
  "walkdir",
 ]

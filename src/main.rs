@@ -17,7 +17,11 @@ fn main() -> anyhow::Result<()> {
     let result = eframe::run_native(
         "Background Picker",
         options,
-        Box::new(|cc| Ok(Box::new(BackgroundPickerApp::new(cc, args)))),
+        Box::new(|cc| {
+            BackgroundPickerApp::new(cc, args)
+                .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        }),
     );
     
     match result {

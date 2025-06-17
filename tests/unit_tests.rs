@@ -1,4 +1,4 @@
-use background_picker::{Args, AppState, BackgroundPickerApp, is_image_file, validate_command};
+use background_picker::{Args, BackgroundPickerApp, is_image_file, validate_command};
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -17,7 +17,7 @@ mod cli_args_tests {
         assert_eq!(args.directory, PathBuf::from("."));
         assert_eq!(args.thumbnail_size, 150);
         assert_eq!(args.command, "feh --bg-max");
-        assert_eq!(args.state_file, PathBuf::from("background-picker-state.yaml"));
+        assert_eq!(args.selected_image_file, PathBuf::from("selected-background.txt"));
         assert!(!args.debug);
         assert!(!args.pregenerate);
     }
@@ -29,7 +29,7 @@ mod cli_args_tests {
             "--directory", "/home/user/pictures",
             "--thumbnail-size", "200",
             "--command", "gsettings set org.gnome.desktop.background picture-uri",
-            "--state-file", "custom-state.yaml",
+            "--selected-image-file", "custom-selected.txt",
             "--debug",
             "--pregenerate"
         ]).unwrap();
@@ -37,7 +37,7 @@ mod cli_args_tests {
         assert_eq!(args.directory, PathBuf::from("/home/user/pictures"));
         assert_eq!(args.thumbnail_size, 200);
         assert_eq!(args.command, "gsettings set org.gnome.desktop.background picture-uri");
-        assert_eq!(args.state_file, PathBuf::from("custom-state.yaml"));
+        assert_eq!(args.selected_image_file, PathBuf::from("custom-selected.txt"));
         assert!(args.debug);
         assert!(args.pregenerate);
     }
@@ -49,13 +49,13 @@ mod cli_args_tests {
             "-d", "/tmp",
             "-t", "100",
             "-c", "echo",
-            "-s", "state.yaml"
+            "-s", "selected.txt"
         ]).unwrap();
         
         assert_eq!(args.directory, PathBuf::from("/tmp"));
         assert_eq!(args.thumbnail_size, 100);
         assert_eq!(args.command, "echo");
-        assert_eq!(args.state_file, PathBuf::from("state.yaml"));
+        assert_eq!(args.selected_image_file, PathBuf::from("selected.txt"));
     }
 
     #[test]
@@ -70,79 +70,84 @@ mod cli_args_tests {
 }
 
 #[cfg(test)]
-mod app_state_tests {
+mod selected_image_tests {
     use super::*;
     use std::fs;
 
     #[test]
-    fn test_app_state_default() {
-        let state = AppState::default();
+    #[serial]
+    fn test_save_selected_image_creates_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let selected_file = temp_dir.path().join("selected.txt");
         
-        assert_eq!(state.last_selected, None);
-        assert!(state.favorites.is_empty());
-        assert_eq!(state.window_size, (0.0, 0.0));
-    }
-
-    #[test]
-    fn test_app_state_serialization() {
-        let state = AppState {
-            last_selected: Some("image1.jpg".to_string()),
-            favorites: vec!["image2.jpg".to_string(), "image3.jpg".to_string()],
-            window_size: (800.0, 600.0),
+        let args = Args {
+            directory: PathBuf::from("."),
+            thumbnail_size: 150,
+            command: "echo".to_string(),
+            selected_image_file: selected_file.clone(),
+            debug: false,
+            pregenerate: false,
         };
         
-        let yaml = serde_yaml::to_string(&state).unwrap();
-        let deserialized: AppState = serde_yaml::from_str(&yaml).unwrap();
-        
-        assert_eq!(deserialized.last_selected, Some("image1.jpg".to_string()));
-        assert_eq!(deserialized.favorites.len(), 2);
-        assert_eq!(deserialized.favorites[0], "image2.jpg");
-        assert_eq!(deserialized.favorites[1], "image3.jpg");
-        assert_eq!(deserialized.window_size, (800.0, 600.0));
-    }
-
-    #[test]
-    #[serial]
-    fn test_load_state_file_not_exists() {
-        let temp_dir = TempDir::new().unwrap();
-        let state_file = temp_dir.path().join("nonexistent.yaml");
-        
-        let result = BackgroundPickerApp::load_state(&state_file);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    #[serial]
-    fn test_load_state_valid_file() {
-        let temp_dir = TempDir::new().unwrap();
-        let state_file = temp_dir.path().join("state.yaml");
-        
-        let original_state = AppState {
-            last_selected: Some("test.jpg".to_string()),
-            favorites: vec!["fav1.jpg".to_string(), "fav2.jpg".to_string()],
-            window_size: (1024.0, 768.0),
+        // Create a minimal app for testing
+        let app = BackgroundPickerApp {
+            args,
+            images: Arc::new(RwLock::new(Vec::new())),
+            folder_tree: std::collections::HashMap::new(),
+            loading: false,
+            thumbnail_sender: std::sync::mpsc::channel().0,
+            thumbnail_receiver: std::sync::mpsc::channel().1,
+            thread_pool: rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap(),
+            cache_dir: temp_dir.path().to_path_buf(),
         };
         
-        let yaml_content = serde_yaml::to_string(&original_state).unwrap();
-        fs::write(&state_file, yaml_content).unwrap();
+        let test_path = PathBuf::from("/path/to/test/image.jpg");
+        let result = app.save_selected_image(&test_path);
         
-        let loaded_state = BackgroundPickerApp::load_state(&state_file).unwrap();
+        assert!(result.is_ok());
+        assert!(selected_file.exists());
         
-        assert_eq!(loaded_state.last_selected, original_state.last_selected);
-        assert_eq!(loaded_state.favorites, original_state.favorites);
-        assert_eq!(loaded_state.window_size, original_state.window_size);
+        let content = fs::read_to_string(&selected_file).unwrap();
+        assert_eq!(content.trim(), test_path.to_string_lossy());
     }
 
     #[test]
     #[serial]
-    fn test_load_state_invalid_yaml() {
+    fn test_save_selected_image_creates_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let state_file = temp_dir.path().join("invalid.yaml");
+        let nested_dir = temp_dir.path().join("nested").join("dir");
+        let selected_file = nested_dir.join("selected.txt");
         
-        fs::write(&state_file, "invalid: yaml: content: [").unwrap();
+        let args = Args {
+            directory: PathBuf::from("."),
+            thumbnail_size: 150,
+            command: "echo".to_string(),
+            selected_image_file: selected_file.clone(),
+            debug: false,
+            pregenerate: false,
+        };
         
-        let result = BackgroundPickerApp::load_state(&state_file);
-        assert!(result.is_err());
+        // Create a minimal app for testing
+        let app = BackgroundPickerApp {
+            args,
+            images: Arc::new(RwLock::new(Vec::new())),
+            folder_tree: std::collections::HashMap::new(),
+            loading: false,
+            thumbnail_sender: std::sync::mpsc::channel().0,
+            thumbnail_receiver: std::sync::mpsc::channel().1,
+            thread_pool: rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap(),
+            cache_dir: temp_dir.path().to_path_buf(),
+        };
+        
+        let test_path = PathBuf::from("/path/to/image.jpg");
+        let result = app.save_selected_image(&test_path);
+        
+        assert!(result.is_ok());
+        assert!(nested_dir.exists());
+        assert!(selected_file.exists());
+        
+        let content = fs::read_to_string(&selected_file).unwrap();
+        assert_eq!(content.trim(), test_path.to_string_lossy());
     }
 }
 
@@ -433,10 +438,11 @@ mod cache_directory_tests {
         let cache_dir = BackgroundPickerApp::get_thumbnail_cache_dir();
         
         // Should return a valid path
-        assert!(cache_dir.is_absolute());
+        let cache_path = cache_dir.unwrap();
+        assert!(cache_path.is_absolute());
         
         // Should end with thumbnails/normal
-        assert!(cache_dir.ends_with("thumbnails/normal"));
+        assert!(cache_path.ends_with("thumbnails/normal"));
     }
 
     #[test]
@@ -499,9 +505,8 @@ mod file_scanning_tests {
         
         let mut app = BackgroundPickerApp {
             args: args.clone(),
-            state: AppState::default(),
             images: Arc::new(RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: true,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -509,7 +514,7 @@ mod file_scanning_tests {
             cache_dir: temp_dir.path().join("cache"),
         };
         
-        app.scan_images();
+        let _ = app.scan_images();
         
         let images = app.images.read().unwrap();
         
@@ -556,9 +561,8 @@ mod file_scanning_tests {
         
         let mut app = BackgroundPickerApp {
             args: args.clone(),
-            state: AppState::default(),
             images: Arc::new(RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: true,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -566,7 +570,7 @@ mod file_scanning_tests {
             cache_dir: temp_dir.path().join("cache"),
         };
         
-        app.scan_images();
+        let _ = app.scan_images();
         
         let images = app.images.read().unwrap();
         assert_eq!(images.len(), 0);
@@ -590,9 +594,8 @@ mod file_scanning_tests {
         
         let mut app = BackgroundPickerApp {
             args: args.clone(),
-            state: AppState::default(),
             images: Arc::new(RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: true,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -600,7 +603,7 @@ mod file_scanning_tests {
             cache_dir: PathBuf::from("/tmp/cache"),
         };
         
-        app.scan_images();
+        let _ = app.scan_images();
         
         let images = app.images.read().unwrap();
         assert_eq!(images.len(), 0);
@@ -630,9 +633,8 @@ mod error_handling_tests {
         
         let app = BackgroundPickerApp {
             args,
-            state: AppState::default(),
             images: Arc::new(RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: false,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -663,9 +665,8 @@ mod error_handling_tests {
         
         let app = BackgroundPickerApp {
             args,
-            state: AppState::default(),
             images: Arc::new(RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: false,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -695,9 +696,8 @@ mod error_handling_tests {
         
         let app = BackgroundPickerApp {
             args,
-            state: AppState::default(),
             images: Arc::new(RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: false,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -711,14 +711,14 @@ mod error_handling_tests {
 
     #[test]
     #[serial]
-    fn test_save_state_permission_denied() {
+    fn test_save_selected_image_permission_denied() {
         let temp_dir = TempDir::new().unwrap();
         
         let mut args = Args::try_parse_from(["background-picker"]).unwrap();
         // Try to save to a directory that doesn't exist and can't be created
-        args.state_file = PathBuf::from("/root/forbidden/state.yaml");
+        args.selected_image_file = PathBuf::from("/root/forbidden/selected.txt");
         
-        let (sender, _receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = std::sync::mpsc::channel();
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
@@ -726,17 +726,17 @@ mod error_handling_tests {
         
         let app = BackgroundPickerApp {
             args,
-            state: AppState::default(),
             images: Arc::new(RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: false,
             thumbnail_sender: sender,
-            thumbnail_receiver: _receiver,
+            thumbnail_receiver: receiver,
             thread_pool,
             cache_dir: temp_dir.path().join("cache"),
         };
         
-        let result = app.save_state();
+        let test_path = PathBuf::from("/path/to/image.jpg");
+        let result = app.save_selected_image(&test_path);
         assert!(result.is_err());
     }
 }

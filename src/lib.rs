@@ -3,7 +3,7 @@ use eframe::egui;
 use image::imageops::FilterType;
 use image::ImageEncoder;
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, RwLock};
@@ -12,12 +12,39 @@ use std::io::{self, Write};
 use std::time::SystemTime;
 use walkdir::WalkDir;
 
+#[derive(Debug, thiserror::Error)]
+pub enum BackgroundPickerError {
+    #[error("Failed to create thread pool: {0}")]
+    ThreadPoolCreation(#[from] rayon::ThreadPoolBuildError),
+    
+    #[error("Failed to create thumbnail cache directory: {0}")]
+    CacheDirectoryCreation(#[from] std::io::Error),
+    
+    #[error("Failed to generate thumbnail for {path}: {source}")]
+    ThumbnailGeneration {
+        path: PathBuf,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    
+    #[error("Failed to save selected image path: {0}")]
+    SaveSelectedImage(std::io::Error),
+    
+    #[error("Command execution failed: {0}")]
+    CommandExecution(String),
+    
+    #[error("Invalid image file: {0}")]
+    InvalidImageFile(PathBuf),
+    
+    #[error("Lock acquisition failed")]
+    LockAcquisition,
+}
+
+pub type Result<T> = std::result::Result<T, BackgroundPickerError>;
+
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif", "bmp", "webp"];
 const DEFAULT_PRELOAD_COUNT: usize = 8;
 const CHUNK_SIZE: usize = 100;
 const MIN_THREAD_COUNT: usize = 4;
-const INTERMEDIATE_SIZE_MULTIPLIER: u32 = 4;
-const SMALL_IMAGE_THRESHOLD: u32 = 2;
 const PROGRESS_THRESHOLD: usize = 50;
 
 #[derive(Parser, Clone)]
@@ -55,7 +82,7 @@ pub struct ImageInfo {
 pub struct BackgroundPickerApp {
     pub args: Args,
     pub images: Arc<RwLock<Vec<ImageInfo>>>,
-    pub folder_tree: BTreeMap<String, Vec<usize>>,
+    pub folder_tree: HashMap<String, Vec<usize>>,
     pub loading: bool,
     pub thumbnail_sender: std::sync::mpsc::Sender<(usize, egui::ColorImage)>,
     pub thumbnail_receiver: std::sync::mpsc::Receiver<(usize, egui::ColorImage)>,
@@ -64,17 +91,16 @@ pub struct BackgroundPickerApp {
 }
 
 impl BackgroundPickerApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, args: Args) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, args: Args) -> Result<Self> {
         let (thumbnail_sender, thumbnail_receiver) = std::sync::mpsc::channel();
         
         // Create thread pool with optimal number of threads
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_cpus::get().max(MIN_THREAD_COUNT))
-            .build()
-            .expect("Failed to create thread pool");
+            .build()?;
         
         // Set up thumbnail cache directory (freedesktop.org spec)
-        let cache_dir = Self::get_thumbnail_cache_dir();
+        let cache_dir = Self::get_thumbnail_cache_dir()?;
         if args.debug {
             println!("Using thumbnail cache directory: {:?}", cache_dir);
         }
@@ -82,7 +108,7 @@ impl BackgroundPickerApp {
         let mut app = Self {
             args,
             images: Arc::new(RwLock::new(Vec::new())),
-            folder_tree: BTreeMap::new(),
+            folder_tree: HashMap::new(),
             loading: true,
             thumbnail_sender,
             thumbnail_receiver,
@@ -90,37 +116,30 @@ impl BackgroundPickerApp {
             cache_dir,
         };
         
-        app.scan_images();
+        app.scan_images()?;
         
         if app.args.pregenerate {
-            app.pregenerate_all_thumbnails();
+            app.pregenerate_all_thumbnails()?;
             // Exit after pregeneration, don't show GUI
             std::process::exit(0);
         }
         
-        app
+        Ok(app)
     }
     
-    pub fn get_thumbnail_cache_dir() -> PathBuf {
+    pub fn get_thumbnail_cache_dir() -> Result<PathBuf> {
         // Use freedesktop.org thumbnail specification
-        if let Some(cache_home) = dirs::cache_dir() {
-            let thumbnails_dir = cache_home.join("thumbnails");
+        let cache_home = dirs::cache_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))
+            .unwrap_or_else(|| PathBuf::from(".cache"));
             
-            // Try to create the directory structure if it doesn't exist
-            let normal_dir = thumbnails_dir.join("normal");
-            if fs::create_dir_all(&normal_dir).is_err() {
-                eprintln!("Warning: Could not create thumbnail cache directory");
-            }
-            
-            normal_dir
-        } else {
-            // Fallback to home directory
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".cache")
-                .join("thumbnails")
-                .join("normal")
-        }
+        let normal_dir = cache_home.join("thumbnails").join("normal");
+        
+        // Create the directory structure if it doesn't exist
+        fs::create_dir_all(&normal_dir)
+            .map_err(BackgroundPickerError::CacheDirectoryCreation)?;
+        
+        Ok(normal_dir)
     }
     
     pub fn find_existing_thumbnail(file_path: &Path) -> Option<PathBuf> {
@@ -157,13 +176,14 @@ impl BackgroundPickerApp {
     
     
     
-    pub fn scan_images(&mut self) {
+    pub fn scan_images(&mut self) -> Result<()> {
         let base_path = &self.args.directory;
         
+        // Clear existing data
         {
-            if let Ok(mut images) = self.images.write() {
-                images.clear();
-            }
+            let mut images = self.images.write()
+                .map_err(|_| BackgroundPickerError::LockAcquisition)?;
+            images.clear();
         }
         self.folder_tree.clear();
         
@@ -171,45 +191,39 @@ impl BackgroundPickerApp {
             println!("Scanning directory: {:?}", base_path);
         }
         
+        // Pre-allocate collections to avoid repeated reallocations
+        let mut temp_images = Vec::new();
+        let mut temp_folders: HashMap<String, Vec<usize>> = HashMap::new();
+        
+        // Collect all image files first
         for entry in WalkDir::new(&self.args.directory)
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
             if let Some(ext) = entry.path().extension() {
-                if IMAGE_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str()) {
+                let ext_str = ext.to_string_lossy();
+                if IMAGE_EXTENSIONS.iter().any(|&valid_ext| valid_ext.eq_ignore_ascii_case(&ext_str)) {
                     let relative_path = entry.path()
                         .strip_prefix(base_path)
-                        .unwrap_or(entry.path())
-                        .to_string_lossy()
-                        .to_string();
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| entry.path().to_string_lossy().into_owned());
                     
                     let folder = entry.path()
                         .parent()
                         .and_then(|p| p.strip_prefix(base_path).ok())
-                        .map(|p| p.to_string_lossy().to_string())
-                        .unwrap_or_else(|| ".".to_string());
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| ".".to_owned());
                     
-                    let image_index = {
-                        if let Ok(mut images) = self.images.write() {
-                            let index = images.len();
-                            images.push(ImageInfo {
-                                path: entry.path().to_path_buf(),
-                                thumbnail: None,
-                                relative_path: relative_path.clone(),
-                                loading: false,
-                            });
-                            index
-                        } else {
-                            continue;
-                        }
-                    };
+                    let image_index = temp_images.len();
+                    temp_images.push(ImageInfo {
+                        path: entry.path().to_path_buf(),
+                        thumbnail: None,
+                        relative_path,
+                        loading: false,
+                    });
                     
-                    if self.args.debug {
-                        println!("Found image: {:?} in folder: {}", relative_path, folder);
-                    }
-                    
-                    self.folder_tree
+                    temp_folders
                         .entry(folder)
                         .or_default()
                         .push(image_index);
@@ -217,22 +231,34 @@ impl BackgroundPickerApp {
             }
         }
         
-        let image_count = self.images.read().map(|images| images.len()).unwrap_or(0);
+        // Update the main data structures
+        {
+            let mut images = self.images.write()
+                .map_err(|_| BackgroundPickerError::LockAcquisition)?;
+            *images = temp_images;
+        }
+        self.folder_tree = temp_folders;
+        
         if self.args.debug {
-            println!("Found {} images in {} folders", image_count, self.folder_tree.len());
+            println!("Found {} images in {} folders", 
+                self.images.read().map(|i| i.len()).unwrap_or(0), 
+                self.folder_tree.len());
         }
         
         self.loading = false;
+        Ok(())
     }
     
-    pub fn pregenerate_all_thumbnails(&mut self) {
-        let total_images = self.images.read().map(|images| images.len()).unwrap_or(0);
+    pub fn pregenerate_all_thumbnails(&mut self) -> Result<()> {
+        let total_images = self.images.read()
+            .map_err(|_| BackgroundPickerError::LockAcquisition)?
+            .len();
         
         if total_images == 0 {
             if self.args.debug {
                 println!("No images found to pregenerate thumbnails for");
             }
-            return;
+            return Ok(());
         }
         
         if self.args.debug {
@@ -246,25 +272,26 @@ impl BackgroundPickerApp {
         let mut cached_count = 0;
         
         // Use rayon to process all images in parallel
-        let cache_dir = self.cache_dir.clone();
+        let cache_dir = &self.cache_dir;
         let size = self.args.thumbnail_size;
         let debug = self.args.debug;
-        let images = self.images.clone();
+        let images = Arc::clone(&self.images);
         
         let results: Vec<(bool, bool)> = (0..total_images)
             .collect::<Vec<_>>()
-            .chunks(CHUNK_SIZE) // Process in chunks for progress reporting
+            .par_chunks(CHUNK_SIZE) // Process in chunks for progress reporting
             .enumerate()
             .flat_map(|(chunk_idx, chunk)| {
                 let chunk_results: Vec<(bool, bool)> = chunk.par_iter().map(|&index| {
                     let path = {
-                        if let Ok(images_guard) = images.read() {
-                            if index >= images_guard.len() {
-                                return (false, false); // (was_cached, was_generated)
+                        match images.read() {
+                            Ok(images_guard) => {
+                                if index >= images_guard.len() {
+                                    return (false, false); // (was_cached, was_generated)
+                                }
+                                images_guard[index].path.clone()
                             }
-                            images_guard[index].path.clone()
-                        } else {
-                            return (false, false);
+                            Err(_) => return (false, false),
                         }
                     };
                     
@@ -281,7 +308,7 @@ impl BackgroundPickerApp {
                         }
                     }
                     
-                    if let Some(cache_path) = Self::get_cached_thumbnail_path_static(&abs_path, &cache_dir) {
+                    if let Some(cache_path) = Self::get_cached_thumbnail_path_static(&abs_path, cache_dir) {
                         if Self::is_thumbnail_cache_valid_static(&abs_path, &cache_path) && Self::load_cached_thumbnail(&cache_path, size).is_some() {
                             if debug {
                                 println!("  [{}] Found cached thumbnail: {:?}", 
@@ -294,7 +321,7 @@ impl BackgroundPickerApp {
                     // Generate new thumbnail
                     if let Some(color_image) = Self::fast_thumbnail_generation(&abs_path, size) {
                         // Save to cache
-                        if let Some(cache_path) = Self::get_cached_thumbnail_path_static(&abs_path, &cache_dir) {
+                        if let Some(cache_path) = Self::get_cached_thumbnail_path_static(&abs_path, cache_dir) {
                             Self::save_thumbnail_to_cache(&color_image, &cache_path, &abs_path);
                         }
                         
@@ -347,6 +374,8 @@ impl BackgroundPickerApp {
             println!("Thumbnail generation complete: {} cached, {} generated ({:.1}s)", 
                 cached_count, generated_count, elapsed.as_secs_f64());
         }
+        
+        Ok(())
     }
     
     pub fn load_thumbnail(&mut self, _ctx: &egui::Context, index: usize) {
@@ -465,9 +494,11 @@ impl BackgroundPickerApp {
         // Convert egui::ColorImage back to image format for caching
         let [width, height] = color_image.size;
         
-        let pixels: Vec<u8> = color_image.pixels.iter()
-            .flat_map(|p| [p.r(), p.g(), p.b(), p.a()])
-            .collect();
+        // Pre-allocate vector with exact capacity for better performance
+        let mut pixels = Vec::with_capacity(color_image.pixels.len() * 4);
+        for pixel in &color_image.pixels {
+            pixels.extend_from_slice(&[pixel.r(), pixel.g(), pixel.b(), pixel.a()]);
+        }
         
         if let Some(img_buffer) = image::RgbaImage::from_raw(
             width as u32, 
@@ -530,36 +561,37 @@ impl BackgroundPickerApp {
     
     pub fn fast_thumbnail_generation(path: &Path, size: u32) -> Option<egui::ColorImage> {
         // Use image reader with auto format detection
-        match image::io::Reader::open(path) {
-            Ok(reader) => {
-                let reader = reader.with_guessed_format().ok()?;
-                
-                // Check if we can get dimensions without full decode
-                if let Ok(img) = reader.decode() {
-                    // Quickly check if image is much larger than needed
-                    let (width, height) = (img.width(), img.height());
-                    
-                    // Skip resizing if image is already small
-                    if width <= size * SMALL_IMAGE_THRESHOLD && height <= size * SMALL_IMAGE_THRESHOLD {
-                        return Self::create_thumbnail_fast(img, size);
-                    }
-                    
-                    // For large images, use a two-step resize for better performance
-                    let intermediate_size = size * INTERMEDIATE_SIZE_MULTIPLIER;
-                    if width > intermediate_size || height > intermediate_size {
-                        let intermediate = img.resize(intermediate_size, intermediate_size, FilterType::Nearest);
-                        Self::create_thumbnail_fast(intermediate, size)
-                    } else {
-                        Self::create_thumbnail_fast(img, size)
-                    }
-                } else {
-                    None
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to load image {:?}: {}", path, e);
-                None
-            }
+        let reader = image::io::Reader::open(path).ok()?
+            .with_guessed_format().ok()?;
+        
+        // Try to get dimensions first to avoid full decode if possible
+        let img = reader.decode().ok()?;
+        let (width, height) = (img.width(), img.height());
+        
+        // Early return for already small images
+        if width <= size && height <= size {
+            return Self::create_thumbnail_fast(img, size);
+        }
+        
+        // Calculate optimal resize strategy based on image size
+        let scale_factor = (width.max(height) as f32 / size as f32).max(1.0);
+        
+        if scale_factor > 8.0 {
+            // For very large images, use three-step resize for better quality/performance balance
+            let first_step = (size as f32 * 4.0) as u32;
+            let second_step = (size as f32 * 2.0) as u32;
+            
+            let step1 = img.resize(first_step, first_step, FilterType::Nearest);
+            let step2 = step1.resize(second_step, second_step, FilterType::Triangle);
+            Self::create_thumbnail_fast(step2, size)
+        } else if scale_factor > 4.0 {
+            // For large images, use two-step resize
+            let intermediate_size = size * 2;
+            let intermediate = img.resize(intermediate_size, intermediate_size, FilterType::Nearest);
+            Self::create_thumbnail_fast(intermediate, size)
+        } else {
+            // For moderately sized images, direct resize with higher quality filter
+            Self::create_thumbnail_fast(img, size)
         }
     }
     
@@ -569,9 +601,17 @@ impl BackgroundPickerApp {
         let rgba = thumbnail.to_rgba8();
         let (width, height) = (thumbnail.width() as usize, thumbnail.height() as usize);
         
+        // Pre-allocate the pixel buffer for better performance
+        let pixel_count = width * height;
+        let raw_pixels = rgba.as_raw();
+        
+        if raw_pixels.len() != pixel_count * 4 {
+            return None; // Safety check
+        }
+        
         Some(egui::ColorImage::from_rgba_unmultiplied(
             [width, height],
-            rgba.as_raw(),
+            raw_pixels,
         ))
     }
     
@@ -594,65 +634,81 @@ impl BackgroundPickerApp {
     
     pub fn preload_batch(&mut self, indices: &[usize]) {
         // Preload first few thumbnails when folder opens
-        for &index in indices.iter().take(DEFAULT_PRELOAD_COUNT) {
-            let images_len = self.images.read().map(|images| images.len()).unwrap_or(0);
-            if index >= images_len {
-                continue;
-            }
-            
-            let (should_load, path) = {
-                if let Ok(mut images) = self.images.write() {
-                    if images[index].thumbnail.is_some() || images[index].loading {
-                        continue;
-                    }
-                    images[index].loading = true;
-                    (true, images[index].path.clone())
-                } else {
-                    continue;
-                }
+        let images_len = match self.images.read() {
+            Ok(images) => images.len(),
+            Err(_) => return,
+        };
+        
+        // Collect paths that need loading to minimize lock time
+        let mut paths_to_load = Vec::new();
+        
+        {
+            let mut images = match self.images.write() {
+                Ok(images) => images,
+                Err(_) => return,
             };
             
-            if should_load {
-                let sender = self.thumbnail_sender.clone();
-                let size = self.args.thumbnail_size;
-                let cache_dir = self.cache_dir.clone();
-                let debug = self.args.debug;
+            for &index in indices.iter().take(DEFAULT_PRELOAD_COUNT) {
+                if index >= images_len {
+                    continue;
+                }
                 
-                self.thread_pool.spawn(move || {
-                    if let Some(color_image) = Self::load_or_generate_thumbnail(&path, size, &cache_dir, debug) {
-                        let _ = sender.send((index, color_image));
-                    }
-                });
+                if images[index].thumbnail.is_none() && !images[index].loading {
+                    images[index].loading = true;
+                    paths_to_load.push((index, images[index].path.clone()));
+                }
             }
+        }
+        
+        // Spawn loading tasks
+        let sender = self.thumbnail_sender.clone();
+        let size = self.args.thumbnail_size;
+        let cache_dir = self.cache_dir.clone();
+        let debug = self.args.debug;
+        
+        for (index, path) in paths_to_load {
+            let sender = sender.clone();
+            let cache_dir = cache_dir.clone();
+            
+            self.thread_pool.spawn(move || {
+                if let Some(color_image) = Self::load_or_generate_thumbnail(&path, size, &cache_dir, debug) {
+                    let _ = sender.send((index, color_image));
+                }
+            });
         }
     }
     
-    pub fn set_background(&self, path: &Path) -> anyhow::Result<()> {
+    pub fn set_background(&self, path: &Path) -> Result<()> {
         let command_parts: Vec<&str> = self.args.command.split_whitespace().collect();
         if command_parts.is_empty() {
-            return Err(anyhow::anyhow!("Empty command"));
+            return Err(BackgroundPickerError::CommandExecution("Empty command".to_owned()));
         }
         
         let mut cmd = Command::new(command_parts[0]);
         cmd.args(&command_parts[1..]);
         cmd.arg(path);
         
-        let output = cmd.output()?;
+        let output = cmd.output()
+            .map_err(|e| BackgroundPickerError::CommandExecution(e.to_string()))?;
+        
         if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "Command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(BackgroundPickerError::CommandExecution(error_msg.into_owned()));
         }
         
         Ok(())
     }
     
-    pub fn save_selected_image(&self, path: &Path) -> anyhow::Result<()> {
+    pub fn save_selected_image(&self, path: &Path) -> Result<()> {
         if let Some(parent) = self.args.selected_image_file.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)
+                .map_err(BackgroundPickerError::SaveSelectedImage)?;
         }
-        fs::write(&self.args.selected_image_file, path.to_string_lossy().as_bytes())?;
+        
+        let path_str = path.to_string_lossy();
+        fs::write(&self.args.selected_image_file, path_str.as_bytes())
+            .map_err(BackgroundPickerError::SaveSelectedImage)?;
+        
         Ok(())
     }
 }
@@ -673,12 +729,12 @@ impl eframe::App for BackgroundPickerApp {
             ui.separator();
             
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let folders: Vec<String> = self.folder_tree.keys().cloned().collect();
-                for folder in folders {
-                    let image_indices: Vec<usize> = self.folder_tree.get(&folder)
-                        .cloned()
-                        .unwrap_or_default();
-                    
+                // Clone folder data to avoid borrowing issues
+                let folders: Vec<(String, Vec<usize>)> = self.folder_tree.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                
+                for (folder, image_indices) in folders {
                     let folder_label = if folder == "." { 
                         format!("Root ({} images)", image_indices.len())
                     } else { 
@@ -692,22 +748,25 @@ impl eframe::App for BackgroundPickerApp {
                                 for index in &image_indices {
                                     self.load_thumbnail(ctx, *index);
                                     
-                                    let (_has_thumbnail, is_loading, path, relative_path, texture_ref) = {
-                                        if let Ok(images) = self.images.read() {
-                                            if *index >= images.len() {
-                                                continue;
+                                    let image_info = {
+                                        match self.images.read() {
+                                            Ok(images) => {
+                                                if *index >= images.len() {
+                                                    continue;
+                                                }
+                                                // Clone the data we need
+                                                (
+                                                    images[*index].loading,
+                                                    images[*index].path.clone(),
+                                                    images[*index].relative_path.clone(),
+                                                    images[*index].thumbnail.clone()
+                                                )
                                             }
-                                            (
-                                                images[*index].thumbnail.is_some(),
-                                                images[*index].loading,
-                                                images[*index].path.clone(),
-                                                images[*index].relative_path.clone(),
-                                                images[*index].thumbnail.clone()
-                                            )
-                                        } else {
-                                            continue;
+                                            Err(_) => continue,
                                         }
                                     };
+                                    
+                                    let (is_loading, path, relative_path, texture_ref) = image_info;
                                     
                                     if let Some(texture) = texture_ref {
                                         let image_button = egui::ImageButton::new(&texture)
@@ -767,17 +826,16 @@ impl eframe::App for BackgroundPickerApp {
 }
 
 pub fn is_image_file(path: &Path) -> bool {
-    if let Some(ext) = path.extension() {
-        IMAGE_EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str())
-    } else {
-        false
-    }
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext_str| IMAGE_EXTENSIONS.iter().any(|&valid_ext| valid_ext.eq_ignore_ascii_case(ext_str)))
+        .unwrap_or(false)
 }
 
-pub fn validate_command(command: &str) -> anyhow::Result<()> {
-    let command_parts: Vec<&str> = command.split_whitespace().collect();
-    if command_parts.is_empty() {
-        return Err(anyhow::anyhow!("Empty command"));
+pub fn validate_command(command: &str) -> Result<()> {
+    // Check if command has any non-whitespace characters without allocating
+    if command.trim().is_empty() {
+        return Err(BackgroundPickerError::CommandExecution("Empty command".to_owned()));
     }
     Ok(())
 }

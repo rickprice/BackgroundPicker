@@ -1,4 +1,4 @@
-use background_picker::{Args, BackgroundPickerApp, AppState};
+use background_picker::{Args, BackgroundPickerApp};
 use clap::Parser;
 use std::fs;
 use tempfile::TempDir;
@@ -82,9 +82,8 @@ mod tests {
         
         let mut app = BackgroundPickerApp {
             args: args.clone(),
-            state: AppState::default(),
             images: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: true,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -92,7 +91,7 @@ mod tests {
             cache_dir: temp_dir.path().join("cache"),
         };
         
-        app.scan_images();
+        let _ = app.scan_images();
         
         let images = app.images.read().unwrap();
         
@@ -142,68 +141,46 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_state_persistence_workflow() {
+    fn test_selected_image_persistence_workflow() {
         let temp_dir = TempDir::new().unwrap();
-        let state_file = temp_dir.path().join("test_state.yaml");
+        let selected_file = temp_dir.path().join("selected_image.txt");
         
-        // Create an initial state
-        let initial_state = AppState {
-            last_selected: Some("vacation/beach.jpg".to_string()),
-            favorites: vec![
-                "nature/forest.jpg".to_string(),
-                "abstract/colors.png".to_string(),
-            ],
-            window_size: (1920.0, 1080.0),
-        };
-        
-        // Save the state
-        let yaml_content = serde_yaml::to_string(&initial_state).unwrap();
-        fs::write(&state_file, yaml_content).unwrap();
-        
-        // Load state using the app
-        let loaded_state = BackgroundPickerApp::load_state(&state_file).unwrap();
-        
-        // Verify loaded state matches initial state
-        assert_eq!(loaded_state.last_selected, initial_state.last_selected);
-        assert_eq!(loaded_state.favorites, initial_state.favorites);
-        assert_eq!(loaded_state.window_size, initial_state.window_size);
-        
-        // Test modification and re-saving
         let mut args = Args::try_parse_from(["background-picker"]).unwrap();
-        args.state_file = state_file.clone();
+        args.selected_image_file = selected_file.clone();
         
-        let (sender, _receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = std::sync::mpsc::channel();
         let thread_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build()
             .unwrap();
         
-        let mut app = BackgroundPickerApp {
+        let app = BackgroundPickerApp {
             args,
-            state: loaded_state,
             images: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: false,
             thumbnail_sender: sender,
-            thumbnail_receiver: _receiver,
+            thumbnail_receiver: receiver,
             thread_pool,
             cache_dir: temp_dir.path().join("cache"),
         };
         
-        // Modify state
-        app.state.last_selected = Some("new_selection.jpg".to_string());
-        app.state.favorites.push("new_favorite.png".to_string());
-        app.state.window_size = (1280.0, 720.0);
+        // Save a selected image
+        let first_image = std::path::PathBuf::from("/path/to/vacation/beach.jpg");
+        app.save_selected_image(&first_image).unwrap();
         
-        // Save modified state
-        app.save_state().unwrap();
+        // Verify the file was created and contains the correct path
+        assert!(selected_file.exists());
+        let content = fs::read_to_string(&selected_file).unwrap();
+        assert_eq!(content.trim(), first_image.to_string_lossy());
         
-        // Load again and verify changes
-        let final_state = BackgroundPickerApp::load_state(&state_file).unwrap();
-        assert_eq!(final_state.last_selected, Some("new_selection.jpg".to_string()));
-        assert_eq!(final_state.favorites.len(), 3);
-        assert_eq!(final_state.favorites[2], "new_favorite.png");
-        assert_eq!(final_state.window_size, (1280.0, 720.0));
+        // Update with a new selection
+        let second_image = std::path::PathBuf::from("/path/to/nature/forest.jpg");
+        app.save_selected_image(&second_image).unwrap();
+        
+        // Verify the file was updated
+        let updated_content = fs::read_to_string(&selected_file).unwrap();
+        assert_eq!(updated_content.trim(), second_image.to_string_lossy());
     }
 
     #[test]
@@ -291,9 +268,8 @@ mod tests {
         
         let app = BackgroundPickerApp {
             args,
-            state: AppState::default(),
             images: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: false,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -310,9 +286,8 @@ mod tests {
         
         let app2 = BackgroundPickerApp {
             args: args2,
-            state: AppState::default(),
             images: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: false,
             thumbnail_sender: app.thumbnail_sender.clone(),
             thumbnail_receiver: app.thumbnail_receiver,
@@ -343,9 +318,8 @@ mod tests {
         
         let mut app = BackgroundPickerApp {
             args: args.clone(),
-            state: AppState::default(),
             images: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: true,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -354,7 +328,7 @@ mod tests {
         };
         
         // First scan for images
-        app.scan_images();
+        let _ = app.scan_images();
         
         let image_count = app.images.read().unwrap().len();
         assert_eq!(image_count, 13); // Should find 13 image files
@@ -362,7 +336,7 @@ mod tests {
         // Test pregeneration (this doesn't exit in test environment)
         // We'll test the pregeneration logic without the exit
         let start_time = std::time::Instant::now();
-        app.pregenerate_all_thumbnails();
+        let _ = app.pregenerate_all_thumbnails();
         let elapsed = start_time.elapsed();
         
         // Pregeneration should complete relatively quickly for small test images
@@ -412,9 +386,8 @@ mod tests {
         
         let mut app = BackgroundPickerApp {
             args: args.clone(),
-            state: AppState::default(),
             images: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
-            folder_tree: std::collections::BTreeMap::new(),
+            folder_tree: std::collections::HashMap::new(),
             loading: true,
             thumbnail_sender: sender,
             thumbnail_receiver: _receiver,
@@ -422,7 +395,7 @@ mod tests {
             cache_dir: temp_dir.path().join("cache"),
         };
         
-        app.scan_images();
+        let _ = app.scan_images();
         
         let images = app.images.read().unwrap();
         
