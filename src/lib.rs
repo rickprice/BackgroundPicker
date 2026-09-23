@@ -378,7 +378,7 @@ impl BackgroundPickerApp {
         Ok(())
     }
     
-    pub fn load_thumbnail(&mut self, _ctx: &egui::Context, index: usize) {
+    pub fn load_thumbnail(&mut self, index: usize) {
         let images_len = self.images.read().map(|images| images.len()).unwrap_or(0);
         if index >= images_len {
             return;
@@ -472,7 +472,7 @@ impl BackgroundPickerApp {
     }
     
     pub fn load_cached_thumbnail(cache_path: &Path, target_size: u32) -> Option<egui::ColorImage> {
-        match image::io::Reader::open(cache_path) {
+        match image::ImageReader::open(cache_path) {
             Ok(reader) => {
                 if let Ok(img) = reader.with_guessed_format().ok()?.decode() {
                     // Resize cached thumbnail to target size if needed
@@ -549,7 +549,7 @@ impl BackgroundPickerApp {
                 rgb_img.as_raw(),
                 img.width(),
                 img.height(),
-                image::ColorType::Rgb8,
+                image::ExtendedColorType::Rgb8,
             ) {
                 eprintln!("Failed to save thumbnail for {:?}: {}", original_path, e);
             }
@@ -561,7 +561,7 @@ impl BackgroundPickerApp {
     
     pub fn fast_thumbnail_generation(path: &Path, size: u32) -> Option<egui::ColorImage> {
         // Use image reader with auto format detection
-        let reader = image::io::Reader::open(path).ok()?
+        let reader = image::ImageReader::open(path).ok()?
             .with_guessed_format().ok()?;
         
         // Try to get dimensions first to avoid full decode if possible
@@ -714,47 +714,46 @@ impl BackgroundPickerApp {
 }
 
 impl eframe::App for BackgroundPickerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.process_thumbnail_results(ctx);
-        
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.process_thumbnail_results(ui.ctx());
+
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.loading {
                 ui.centered_and_justified(|ui| {
                     ui.label("Scanning for images...");
                 });
                 return;
             }
-            
+
             ui.heading("Background Picker");
             ui.separator();
-            
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // Clone folder data to avoid borrowing issues
                 let folders: Vec<(String, Vec<usize>)> = self.folder_tree.iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                
+
                 for (folder, image_indices) in folders {
-                    let folder_label = if folder == "." { 
+                    let folder_label = if folder.is_empty() {
                         format!("Root ({} images)", image_indices.len())
-                    } else { 
+                    } else {
                         format!("{} ({} images)", folder, image_indices.len())
                     };
-                    
+
                     let header_response = egui::CollapsingHeader::new(folder_label)
                         .default_open(false)
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 for index in &image_indices {
-                                    self.load_thumbnail(ctx, *index);
-                                    
+                                    self.load_thumbnail(*index);
+
                                     let image_info = {
                                         match self.images.read() {
                                             Ok(images) => {
                                                 if *index >= images.len() {
                                                     continue;
                                                 }
-                                                // Clone the data we need
                                                 (
                                                     images[*index].loading,
                                                     images[*index].path.clone(),
@@ -765,24 +764,23 @@ impl eframe::App for BackgroundPickerApp {
                                             Err(_) => continue,
                                         }
                                     };
-                                    
+
                                     let (is_loading, path, relative_path, texture_ref) = image_info;
-                                    
+
                                     if let Some(texture) = texture_ref {
-                                        let image_button = egui::ImageButton::new(&texture)
-                                            .frame(true);
-                                        
-                                        let button_response = ui.add(image_button);
-                                        if button_response.clicked() {
+                                        let response = ui.add(
+                                            egui::Image::new(&texture)
+                                                .sense(egui::Sense::click())
+                                        );
+                                        if response.clicked() {
                                             if let Err(e) = self.set_background(&path) {
                                                 eprintln!("Failed to set background: {}", e);
                                             } else {
                                                 let _ = self.save_selected_image(&path);
-                                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                                             }
                                         }
-                                        
-                                        button_response.on_hover_text(&relative_path);
+                                        response.on_hover_text(&relative_path);
                                     } else {
                                         // Show placeholder for loading images
                                         let size = self.args.thumbnail_size as f32;
@@ -792,10 +790,10 @@ impl eframe::App for BackgroundPickerApp {
                                         );
                                         ui.painter().rect_filled(
                                             rect,
-                                            egui::Rounding::same(5.0),
+                                            5.0_f32,
                                             egui::Color32::LIGHT_GRAY
                                         );
-                                        
+
                                         let loading_text = if is_loading { "Loading..." } else { "Click to load" };
                                         ui.painter().text(
                                             rect.center(),
@@ -809,7 +807,7 @@ impl eframe::App for BackgroundPickerApp {
                                 }
                             });
                         });
-                    
+
                     // If folder was just opened, preload some thumbnails
                     if let Some(body_response) = header_response.body_response {
                         if body_response.rect.height() > 0.0 {
@@ -819,10 +817,9 @@ impl eframe::App for BackgroundPickerApp {
                 }
             });
         });
-        
-        ctx.request_repaint(); // Keep updating to process thumbnail results
+
+        ui.ctx().request_repaint(); // Keep updating to process thumbnail results
     }
-    
 }
 
 pub fn is_image_file(path: &Path) -> bool {

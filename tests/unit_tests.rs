@@ -740,3 +740,720 @@ mod error_handling_tests {
         assert!(result.is_err());
     }
 }
+
+// Helper to create a valid PNG image at the given path
+fn create_real_png(path: &std::path::Path, width: u32, height: u32) {
+    use image::{DynamicImage, ImageBuffer, RgbImage};
+    let img: RgbImage = ImageBuffer::from_fn(width, height, |x, y| {
+        image::Rgb([(x % 255) as u8, (y % 255) as u8, 128u8])
+    });
+    DynamicImage::ImageRgb8(img).save(path).unwrap();
+}
+
+
+#[cfg(test)]
+mod real_image_tests {
+    use super::*;
+    use image::{DynamicImage, ImageBuffer, RgbImage};
+
+    #[test]
+    #[serial]
+    fn test_fast_thumbnail_generation_real_png() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.png");
+        create_real_png(&path, 200, 200);
+
+        let result = BackgroundPickerApp::fast_thumbnail_generation(&path, 100);
+        assert!(result.is_some());
+        let thumb = result.unwrap();
+        assert_eq!(thumb.size[0], 100);
+        assert_eq!(thumb.size[1], 100);
+        assert_eq!(thumb.pixels.len(), 100 * 100);
+    }
+
+    #[test]
+    #[serial]
+    fn test_fast_thumbnail_generation_real_jpeg() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.jpg");
+        let img: RgbImage = ImageBuffer::from_fn(200, 200, |x, y| {
+            image::Rgb([(x % 255) as u8, (y % 255) as u8, 64u8])
+        });
+        DynamicImage::ImageRgb8(img).save(&path).unwrap();
+
+        let result = BackgroundPickerApp::fast_thumbnail_generation(&path, 100);
+        assert!(result.is_some());
+        let thumb = result.unwrap();
+        // JPEG may not produce exactly 100x100 due to aspect ratio, but pixels match dimensions
+        assert_eq!(thumb.pixels.len(), thumb.size[0] * thumb.size[1]);
+    }
+
+    // Scale factor > 4 path: max(width, height) / size > 4 → need image > 400px for size=100
+    #[test]
+    #[serial]
+    fn test_fast_thumbnail_generation_scale_factor_4x() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("large.png");
+        create_real_png(&path, 500, 500);
+
+        let result = BackgroundPickerApp::fast_thumbnail_generation(&path, 100);
+        assert!(result.is_some());
+        let thumb = result.unwrap();
+        assert_eq!(thumb.size[0], 100);
+        assert_eq!(thumb.size[1], 100);
+    }
+
+    // Scale factor > 8 path: max(width, height) / size > 8 → need image > 800px for size=100
+    #[test]
+    #[serial]
+    fn test_fast_thumbnail_generation_scale_factor_8x() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("verylarge.png");
+        create_real_png(&path, 900, 900);
+
+        let result = BackgroundPickerApp::fast_thumbnail_generation(&path, 100);
+        assert!(result.is_some());
+        let thumb = result.unwrap();
+        assert_eq!(thumb.size[0], 100);
+        assert_eq!(thumb.size[1], 100);
+    }
+
+    // Image already smaller than target size — early return path
+    #[test]
+    #[serial]
+    fn test_fast_thumbnail_generation_small_image_passthrough() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("small.png");
+        create_real_png(&path, 40, 40);
+
+        let result = BackgroundPickerApp::fast_thumbnail_generation(&path, 100);
+        assert!(result.is_some());
+        let thumb = result.unwrap();
+        // Image was 40x40, smaller than target, so resize still runs (size <= target)
+        assert_eq!(thumb.pixels.len(), thumb.size[0] * thumb.size[1]);
+    }
+}
+
+#[cfg(test)]
+mod non_square_image_tests {
+    use super::*;
+    use image::{DynamicImage, ImageBuffer, RgbImage};
+
+    #[test]
+    fn test_create_thumbnail_fast_landscape() {
+        // 200 wide, 100 tall — resize to fit within 50x50 preserves aspect ratio → 50x25
+        let img: RgbImage = ImageBuffer::new(200, 100);
+        let result = BackgroundPickerApp::create_thumbnail_fast(DynamicImage::ImageRgb8(img), 50);
+        assert!(result.is_some());
+        let thumb = result.unwrap();
+        assert_eq!(thumb.size[0], 50); // width limited by size
+        assert_eq!(thumb.size[1], 25); // height proportional
+        assert_eq!(thumb.pixels.len(), 50 * 25);
+    }
+
+    #[test]
+    fn test_create_thumbnail_fast_portrait() {
+        // 100 wide, 200 tall — resize to fit within 50x50 → 25x50
+        let img: RgbImage = ImageBuffer::new(100, 200);
+        let result = BackgroundPickerApp::create_thumbnail_fast(DynamicImage::ImageRgb8(img), 50);
+        assert!(result.is_some());
+        let thumb = result.unwrap();
+        assert_eq!(thumb.size[0], 25);
+        assert_eq!(thumb.size[1], 50);
+        assert_eq!(thumb.pixels.len(), 25 * 50);
+    }
+
+    #[test]
+    fn test_create_thumbnail_fast_1x1_image() {
+        let img: RgbImage = ImageBuffer::new(1, 1);
+        let result = BackgroundPickerApp::create_thumbnail_fast(DynamicImage::ImageRgb8(img), 50);
+        assert!(result.is_some());
+        let thumb = result.unwrap();
+        assert_eq!(thumb.pixels.len(), thumb.size[0] * thumb.size[1]);
+    }
+
+    #[test]
+    fn test_create_thumbnail_fast_pixel_count_matches_dimensions() {
+        // Invariant: pixels.len() == size[0] * size[1] for any input
+        for &(w, h) in &[(100u32, 100u32), (300, 150), (150, 300), (1, 1), (1000, 500)] {
+            let img: RgbImage = ImageBuffer::new(w, h);
+            let result = BackgroundPickerApp::create_thumbnail_fast(DynamicImage::ImageRgb8(img), 64);
+            assert!(result.is_some(), "Failed for {}x{}", w, h);
+            let thumb = result.unwrap();
+            assert_eq!(
+                thumb.pixels.len(),
+                thumb.size[0] * thumb.size[1],
+                "Pixel count mismatch for {}x{}", w, h
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_save_load_tests {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_save_and_load_thumbnail_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let original = temp_dir.path().join("original.png");
+        create_real_png(&original, 200, 200);
+
+        let cache_dir = temp_dir.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_dir.join("thumb.png");
+
+        // Generate a thumbnail
+        let generated = BackgroundPickerApp::fast_thumbnail_generation(&original, 100).unwrap();
+
+        // Save it to cache
+        BackgroundPickerApp::save_thumbnail_to_cache(&generated, &cache_path, &original);
+        assert!(cache_path.exists(), "Cache file should be created");
+
+        // Load it back
+        let loaded = BackgroundPickerApp::load_cached_thumbnail(&cache_path, 100);
+        assert!(loaded.is_some(), "Should load from cache");
+        let loaded_thumb = loaded.unwrap();
+        assert_eq!(loaded_thumb.pixels.len(), loaded_thumb.size[0] * loaded_thumb.size[1]);
+    }
+
+    #[test]
+    fn test_load_cached_thumbnail_nonexistent_file() {
+        let result = BackgroundPickerApp::load_cached_thumbnail(
+            &PathBuf::from("/nonexistent/thumbnail.png"),
+            100,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_cached_thumbnail_corrupt_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let corrupt = temp_dir.path().join("corrupt.png");
+        fs::write(&corrupt, b"this is not a valid png file").unwrap();
+
+        let result = BackgroundPickerApp::load_cached_thumbnail(&corrupt, 100);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_thumbnail_with_metadata_creates_png() {
+        let temp_dir = TempDir::new().unwrap();
+        let original = temp_dir.path().join("original.png");
+        create_real_png(&original, 100, 100);
+
+        let out_path = temp_dir.path().join("output.png");
+        let img = image::open(&original).unwrap();
+        BackgroundPickerApp::save_thumbnail_with_metadata(&img, &out_path, &original);
+
+        assert!(out_path.exists(), "Output PNG should be created");
+        assert!(out_path.metadata().unwrap().len() > 0, "Output file should not be empty");
+    }
+
+    #[test]
+    #[serial]
+    fn test_load_cached_thumbnail_resizes_if_different_size() {
+        let temp_dir = TempDir::new().unwrap();
+        let original = temp_dir.path().join("original.png");
+        create_real_png(&original, 200, 200);
+
+        let cache_dir = temp_dir.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let cache_path = cache_dir.join("thumb.png");
+
+        // Save a 100x100 thumbnail
+        let generated = BackgroundPickerApp::fast_thumbnail_generation(&original, 100).unwrap();
+        BackgroundPickerApp::save_thumbnail_to_cache(&generated, &cache_path, &original);
+
+        // Load it back at a different target size (64)
+        let loaded = BackgroundPickerApp::load_cached_thumbnail(&cache_path, 64);
+        assert!(loaded.is_some());
+        let thumb = loaded.unwrap();
+        // Should have been resized to fit within 64x64
+        assert!(thumb.size[0] <= 64 && thumb.size[1] <= 64);
+    }
+}
+
+#[cfg(test)]
+mod find_existing_thumbnail_tests {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_find_existing_thumbnail_with_valid_cached_thumbnail() {
+        let temp_dir = TempDir::new().unwrap();
+        let original = temp_dir.path().join("image.png");
+        create_real_png(&original, 200, 200);
+
+        let cache_dir = temp_dir.path().join("thumbnails").join("normal");
+        fs::create_dir_all(&cache_dir).unwrap();
+
+        let abs_original = fs::canonicalize(&original).unwrap();
+        let hash = BackgroundPickerApp::get_thumbnail_hash(&abs_original).unwrap();
+        let thumb_path = cache_dir.join(format!("{}.png", hash));
+
+        // Save a real thumbnail to the expected cache location
+        let generated = BackgroundPickerApp::fast_thumbnail_generation(&original, 128).unwrap();
+        BackgroundPickerApp::save_thumbnail_to_cache(&generated, &thumb_path, &original);
+
+        // Override dirs::cache_dir is not possible, but we verify the hash logic is consistent
+        // The function uses dirs::cache_dir() internally so we can't easily redirect it in tests.
+        // Instead, test that get_thumbnail_hash produces the SHA1 of the file:// URI format.
+        let uri = format!("file://{}", abs_original.to_string_lossy());
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(uri.as_bytes());
+        let expected_hash = format!("{:x}", hasher.finalize());
+        assert_eq!(hash, expected_hash, "Hash should match SHA1 of file URI");
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_cached_thumbnail_path_static_same_file_same_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("img.png");
+        File::create(&file).unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+
+        let path1 = BackgroundPickerApp::get_cached_thumbnail_path_static(&file, &cache_dir);
+        let path2 = BackgroundPickerApp::get_cached_thumbnail_path_static(&file, &cache_dir);
+
+        assert_eq!(path1, path2, "Same file must always produce the same cache path");
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_cached_thumbnail_path_static_different_files_different_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let file1 = temp_dir.path().join("img1.png");
+        let file2 = temp_dir.path().join("img2.png");
+        File::create(&file1).unwrap();
+        File::create(&file2).unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+
+        let path1 = BackgroundPickerApp::get_cached_thumbnail_path_static(&file1, &cache_dir);
+        let path2 = BackgroundPickerApp::get_cached_thumbnail_path_static(&file2, &cache_dir);
+
+        assert_ne!(path1, path2, "Different files must produce different cache paths");
+    }
+}
+
+#[cfg(test)]
+mod preload_batch_tests {
+    use super::*;
+    use background_picker::ImageInfo;
+
+    fn make_app_with_images(temp_dir: &TempDir, image_paths: Vec<PathBuf>) -> BackgroundPickerApp {
+        let args = Args {
+            directory: temp_dir.path().to_path_buf(),
+            thumbnail_size: 50,
+            command: "echo".to_string(),
+            selected_image_file: temp_dir.path().join("selected.txt"),
+            debug: false,
+            pregenerate: false,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let images: Vec<ImageInfo> = image_paths
+            .iter()
+            .map(|p| ImageInfo {
+                path: p.clone(),
+                thumbnail: None,
+                relative_path: p.to_string_lossy().into_owned(),
+                loading: false,
+            })
+            .collect();
+        BackgroundPickerApp {
+            args,
+            images: Arc::new(RwLock::new(images)),
+            folder_tree: std::collections::HashMap::new(),
+            loading: false,
+            thumbnail_sender: sender,
+            thumbnail_receiver: receiver,
+            thread_pool,
+            cache_dir: temp_dir.path().join("cache"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_preload_batch_empty_indices() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut app = make_app_with_images(&temp_dir, vec![]);
+        // Should not panic with empty input
+        app.preload_batch(&[]);
+        let images = app.images.read().unwrap();
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_preload_batch_out_of_range_indices() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("a.png");
+        create_real_png(&path, 50, 50);
+        let mut app = make_app_with_images(&temp_dir, vec![path]);
+
+        // Indices beyond the image list — should not panic
+        app.preload_batch(&[100, 200, 999]);
+
+        let images = app.images.read().unwrap();
+        assert_eq!(images.len(), 1);
+        assert!(!images[0].loading); // Out-of-range indices don't affect existing images
+    }
+
+    #[test]
+    #[serial]
+    fn test_preload_batch_marks_images_as_loading() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.png");
+        create_real_png(&path, 50, 50);
+        let mut app = make_app_with_images(&temp_dir, vec![path]);
+
+        app.preload_batch(&[0]);
+
+        // After preload_batch, image should be marked as loading (spawn is async)
+        let images = app.images.read().unwrap();
+        assert!(images[0].loading || images[0].thumbnail.is_some(),
+            "Image should be loading or already have thumbnail");
+    }
+
+    #[test]
+    #[serial]
+    fn test_preload_batch_skips_already_loading() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("test.png");
+        create_real_png(&path, 50, 50);
+        let mut app = make_app_with_images(&temp_dir, vec![path]);
+
+        // Mark image as already loading
+        {
+            let mut images = app.images.write().unwrap();
+            images[0].loading = true;
+        }
+
+        app.preload_batch(&[0]);
+
+        // Loading state should remain true (not reset or double-spawned)
+        let images = app.images.read().unwrap();
+        assert!(images[0].loading);
+    }
+}
+
+#[cfg(test)]
+mod error_message_tests {
+    use super::*;
+    use background_picker::BackgroundPickerError;
+
+    #[test]
+    fn test_error_command_execution_message() {
+        let err = BackgroundPickerError::CommandExecution("feh not found".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("Command execution failed"));
+        assert!(msg.contains("feh not found"));
+    }
+
+    #[test]
+    fn test_error_invalid_image_file_message() {
+        let err = BackgroundPickerError::InvalidImageFile(PathBuf::from("/some/image.tiff"));
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid image file"));
+        assert!(msg.contains("image.tiff"));
+    }
+
+    #[test]
+    fn test_error_lock_acquisition_message() {
+        let err = BackgroundPickerError::LockAcquisition;
+        assert!(err.to_string().contains("Lock acquisition failed"));
+    }
+
+    #[test]
+    fn test_error_cache_directory_creation_message() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let err = BackgroundPickerError::CacheDirectoryCreation(io_err);
+        assert!(err.to_string().contains("Failed to create thumbnail cache directory"));
+    }
+
+    #[test]
+    fn test_error_thumbnail_generation_message() {
+        let source: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"));
+        let err = BackgroundPickerError::ThumbnailGeneration {
+            path: PathBuf::from("/images/test.png"),
+            source,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to generate thumbnail"));
+        assert!(msg.contains("test.png"));
+    }
+}
+
+#[cfg(test)]
+mod additional_scan_tests {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_scan_images_clears_previous_data() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("a.png"), b"fake").unwrap();
+
+        let args = Args {
+            directory: temp_dir.path().to_path_buf(),
+            thumbnail_size: 50,
+            command: "echo".to_string(),
+            selected_image_file: temp_dir.path().join("sel.txt"),
+            debug: false,
+            pregenerate: false,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+
+        let mut app = BackgroundPickerApp {
+            args,
+            images: Arc::new(RwLock::new(Vec::new())),
+            folder_tree: std::collections::HashMap::new(),
+            loading: true,
+            thumbnail_sender: sender,
+            thumbnail_receiver: receiver,
+            thread_pool,
+            cache_dir: temp_dir.path().join("cache"),
+        };
+
+        app.scan_images().unwrap();
+        assert_eq!(app.images.read().unwrap().len(), 1);
+
+        // Add more files and rescan — previous data should be cleared
+        fs::write(temp_dir.path().join("b.jpg"), b"fake").unwrap();
+        fs::write(temp_dir.path().join("c.gif"), b"fake").unwrap();
+
+        app.scan_images().unwrap();
+        assert_eq!(app.images.read().unwrap().len(), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_images_relative_paths_exclude_base() {
+        let temp_dir = TempDir::new().unwrap();
+        let sub = temp_dir.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("photo.png"), b"fake").unwrap();
+
+        let args = Args {
+            directory: temp_dir.path().to_path_buf(),
+            thumbnail_size: 50,
+            command: "echo".to_string(),
+            selected_image_file: temp_dir.path().join("sel.txt"),
+            debug: false,
+            pregenerate: false,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+
+        let mut app = BackgroundPickerApp {
+            args,
+            images: Arc::new(RwLock::new(Vec::new())),
+            folder_tree: std::collections::HashMap::new(),
+            loading: true,
+            thumbnail_sender: sender,
+            thumbnail_receiver: receiver,
+            thread_pool,
+            cache_dir: temp_dir.path().join("cache"),
+        };
+
+        app.scan_images().unwrap();
+
+        let images = app.images.read().unwrap();
+        assert_eq!(images.len(), 1);
+        // Relative path should not start with the base directory
+        let rel = &images[0].relative_path;
+        assert!(!rel.starts_with('/'), "Relative path should not be absolute: {}", rel);
+        assert!(rel.contains("photo.png"), "Relative path should contain filename: {}", rel);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_images_folder_tree_root_key() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("root.png"), b"fake").unwrap();
+
+        let args = Args {
+            directory: temp_dir.path().to_path_buf(),
+            thumbnail_size: 50,
+            command: "echo".to_string(),
+            selected_image_file: temp_dir.path().join("sel.txt"),
+            debug: false,
+            pregenerate: false,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+
+        let mut app = BackgroundPickerApp {
+            args,
+            images: Arc::new(RwLock::new(Vec::new())),
+            folder_tree: std::collections::HashMap::new(),
+            loading: true,
+            thumbnail_sender: sender,
+            thumbnail_receiver: receiver,
+            thread_pool,
+            cache_dir: temp_dir.path().join("cache"),
+        };
+
+        app.scan_images().unwrap();
+
+        // Files at root level produce an empty string key (strip_prefix of the base dir gives "")
+        assert!(
+            app.folder_tree.contains_key(""),
+            "Root images should be stored under empty string key; keys: {:?}",
+            app.folder_tree.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(app.folder_tree[""].len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod additional_utility_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_image_file_mixed_case_extensions() {
+        let cases = vec![
+            ("photo.Jpg", true),
+            ("photo.pNg", true),
+            ("photo.JPEG", true),
+            ("photo.GiF", true),
+            ("photo.BMP", true),
+            ("photo.WebP", true),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(
+                is_image_file(&PathBuf::from(name)),
+                expected,
+                "Failed for {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_image_file_trailing_slash_path() {
+        // Rust strips trailing slashes from paths, so "some/dir.jpg/" is treated as "some/dir.jpg"
+        // and extension() returns Some("jpg"), making is_image_file return true.
+        let path = PathBuf::from("some/dir.jpg/");
+        assert!(is_image_file(&path));
+    }
+
+    #[test]
+    fn test_is_image_file_hidden_file_with_image_extension() {
+        assert!(is_image_file(&PathBuf::from(".hidden.png")));
+    }
+
+    #[test]
+    fn test_is_image_file_multiple_dots_in_name() {
+        assert!(is_image_file(&PathBuf::from("my.photo.2024.jpg")));
+        assert!(!is_image_file(&PathBuf::from("my.photo.2024.txt")));
+    }
+
+    #[test]
+    fn test_validate_command_with_path_containing_spaces() {
+        // Command with embedded path-like args should still be valid
+        assert!(validate_command("/usr/bin/feh --bg-max").is_ok());
+        assert!(validate_command("   command   ").is_ok()); // has non-space content
+    }
+}
+
+#[cfg(test)]
+mod additional_cache_validation_tests {
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn test_is_thumbnail_cache_valid_original_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_file = temp_dir.path().join("cache.png");
+        let nonexistent_original = temp_dir.path().join("missing_original.jpg");
+
+        File::create(&cache_file).unwrap();
+
+        // When original doesn't exist, metadata returns UNIX_EPOCH → cache appears valid
+        // (this is the existing behavior: a missing original means the cache is "valid")
+        let result = BackgroundPickerApp::is_thumbnail_cache_valid_static(
+            &nonexistent_original,
+            &cache_file,
+        );
+        // Cache was just created, original doesn't exist → defaults to UNIX_EPOCH
+        // cache_modified >= original_modified (UNIX_EPOCH) → true
+        assert!(result, "Cache should appear valid when original is missing");
+    }
+
+    #[test]
+    #[serial]
+    fn test_is_thumbnail_cache_valid_both_files_exist() {
+        let temp_dir = TempDir::new().unwrap();
+        let original = temp_dir.path().join("original.png");
+        let cache = temp_dir.path().join("cache.png");
+
+        File::create(&original).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        File::create(&cache).unwrap();
+
+        assert!(BackgroundPickerApp::is_thumbnail_cache_valid_static(&original, &cache));
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    #[test]
+    fn test_args_clone() {
+        let args = Args {
+            directory: PathBuf::from("/images"),
+            thumbnail_size: 200,
+            command: "feh --bg-fill".to_string(),
+            selected_image_file: PathBuf::from("sel.txt"),
+            debug: true,
+            pregenerate: false,
+        };
+        let cloned = args.clone();
+        assert_eq!(cloned.directory, args.directory);
+        assert_eq!(cloned.thumbnail_size, args.thumbnail_size);
+        assert_eq!(cloned.command, args.command);
+        assert_eq!(cloned.selected_image_file, args.selected_image_file);
+        assert_eq!(cloned.debug, args.debug);
+        assert_eq!(cloned.pregenerate, args.pregenerate);
+    }
+
+    #[test]
+    fn test_args_pregenerate_flag_default_false() {
+        let args = Args::try_parse_from(["background-picker"]).unwrap();
+        assert!(!args.pregenerate);
+    }
+
+    #[test]
+    fn test_args_debug_flag_default_false() {
+        let args = Args::try_parse_from(["background-picker"]).unwrap();
+        assert!(!args.debug);
+    }
+
+    #[test]
+    fn test_args_thumbnail_size_zero() {
+        // thumbnail_size is u32, so 0 is technically valid from CLI
+        let args = Args::try_parse_from(["background-picker", "--thumbnail-size", "0"]).unwrap();
+        assert_eq!(args.thumbnail_size, 0);
+    }
+
+    #[test]
+    fn test_args_command_with_multiple_spaces() {
+        let args = Args::try_parse_from([
+            "background-picker",
+            "--command",
+            "nitrogen --set-zoom-fill --head=0",
+        ])
+        .unwrap();
+        assert_eq!(args.command, "nitrogen --set-zoom-fill --head=0");
+    }
+}
