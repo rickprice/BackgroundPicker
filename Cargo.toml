@@ -1,7 +1,8 @@
 [package]
 name = "background-picker"
 version = "0.2.1"
-edition = "2021"
+edition = "2024"
+rust-version = "1.85"
 authors = ["Frederick Price <fprice@pricemail.ca>"]
 description = "Allow user to select a background from a directory hiearchy"
 homepage = "https://github.com/rickprice/BackgroundPicker"
@@ -14,17 +15,16 @@ image = { version = "0.25", features = ["jpeg", "png"], default-features = false
 walkdir = "2.5"
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.36"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
 thiserror = "2.0"
 rayon = "1.12"
-num_cpus = "1.17"
-sha1 = "0.10"
-dirs = "6.0"
+sha1 = "0.11"
+dirs = "7.0"
+png = "0.17"
 
 [dev-dependencies]
-tempfile = "3.14"
-serial_test = "3.2"
+tempfile = "3.27"
 
 [profile.release]
 opt-level = 3

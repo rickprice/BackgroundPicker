@@ -78,7 +78,7 @@ background-picker -d ~/Pictures
 | `--directory` | `-d` | `.` | Directory to scan for images |
 | `--thumbnail-size` | `-t` | `150` | Thumbnail size in pixels |
 | `--command` | `-c` | `"feh --bg-max"` | Command to set background |
-| `--state-file` | `-s` | `background-picker-state.yaml` | State file path |
+| `--selected-image-file` | `-s` | `selected-background.txt` | File to write the chosen image path to |
 | `--debug` | | | Enable detailed debug output |
 | `--pregenerate` | | | Generate thumbnails and exit (no GUI) |
 | `--help` | `-h` | | Show help information |
@@ -139,14 +139,14 @@ Built with modern Rust ecosystem:
 - **image** - Fast image processing and format support
 - **rayon** - Data parallelism for thumbnail generation
 - **clap** - Command line argument parsing
-- **serde/serde_yaml** - Configuration and state persistence
 - **walkdir** - Efficient directory traversal
 - **dirs** - Cross-platform directory locations
 - **sha1** - Thumbnail cache key generation
+- **png** - Freedesktop-compliant thumbnail metadata encoding
 
 ## Requirements
 
-- **Rust toolchain** (2021 edition)
+- **Rust toolchain** (2024 edition, 1.85+)
 - **Wallpaper utility**: `feh`, `nitrogen`, or custom command
 - **Linux/Unix** environment (uses freedesktop.org standards)
 
