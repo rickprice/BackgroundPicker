@@ -4,6 +4,7 @@ use clap::Parser;
 
 #[derive(Parser, Clone)]
 #[command(name = "background-picker")]
+#[command(version)]
 #[command(about = "A GUI tool for selecting desktop backgrounds")]
 pub struct Args {
     #[arg(short, long, default_value = ".")]
